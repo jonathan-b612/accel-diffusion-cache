@@ -1,0 +1,515 @@
+import copy
+import math
+import torch
+import torch.nn as nn
+
+
+def get_timestep_embedding(timesteps, embedding_dim):
+    """
+    This matches the implementation in Denoising Diffusion Probabilistic Models:
+    From Fairseq.
+    Build sinusoidal embeddings.
+    This matches the implementation in tensor2tensor, but differs slightly
+    from the description in Section 3.5 of "Attention Is All You Need".
+    """
+    assert len(timesteps.shape) == 1
+
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = emb.to(device=timesteps.device)
+    emb = timesteps.float()[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
+
+
+def nonlinearity(x):
+    # swish
+    return x*torch.sigmoid(x)
+
+
+def Normalize(in_channels):
+    return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_channels, with_conv):
+        super().__init__()
+        self.with_conv = with_conv
+        if self.with_conv:
+            self.conv = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=3,
+                                        stride=1,
+                                        padding=1)
+
+    def forward(self, x):
+        x = torch.nn.functional.interpolate(
+            x, scale_factor=2.0, mode="nearest")
+        if self.with_conv:
+            x = self.conv(x)
+        return x
+
+
+class Downsample(nn.Module):
+    def __init__(self, in_channels, with_conv):
+        super().__init__()
+        self.with_conv = with_conv
+        if self.with_conv:
+            # no asymmetric padding in torch conv, must do it ourselves
+            self.conv = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=3,
+                                        stride=2,
+                                        padding=0)
+
+    def forward(self, x):
+        if self.with_conv:
+            pad = (0, 1, 0, 1)
+            x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
+            x = self.conv(x)
+        else:
+            x = torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
+        return x
+
+
+class ResnetBlock(nn.Module):
+    def __init__(self, *, in_channels, out_channels=None, conv_shortcut=False,
+                 dropout, temb_channels=512):
+        super().__init__()
+        self.in_channels = in_channels
+        out_channels = in_channels if out_channels is None else out_channels
+        self.out_channels = out_channels
+        self.use_conv_shortcut = conv_shortcut
+
+        self.norm1 = Normalize(in_channels)
+        self.conv1 = torch.nn.Conv2d(in_channels,
+                                     out_channels,
+                                     kernel_size=3,
+                                     stride=1,
+                                     padding=1)
+        self.temb_proj = torch.nn.Linear(temb_channels,
+                                         out_channels)
+        self.norm2 = Normalize(out_channels)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.conv2 = torch.nn.Conv2d(out_channels,
+                                     out_channels,
+                                     kernel_size=3,
+                                     stride=1,
+                                     padding=1)
+        if self.in_channels != self.out_channels:
+            if self.use_conv_shortcut:
+                self.conv_shortcut = torch.nn.Conv2d(in_channels,
+                                                     out_channels,
+                                                     kernel_size=3,
+                                                     stride=1,
+                                                     padding=1)
+            else:
+                self.nin_shortcut = torch.nn.Conv2d(in_channels,
+                                                    out_channels,
+                                                    kernel_size=1,
+                                                    stride=1,
+                                                    padding=0)
+
+    def forward(self, x, temb):
+        h = x
+        h = self.norm1(h)
+        h = nonlinearity(h)
+        h = self.conv1(h)
+
+        h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None]
+
+        h = self.norm2(h)
+        h = nonlinearity(h)
+        h = self.dropout(h)
+        h = self.conv2(h)
+
+        if self.in_channels != self.out_channels:
+            if self.use_conv_shortcut:
+                x = self.conv_shortcut(x)
+            else:
+                x = self.nin_shortcut(x)
+
+        return x+h
+
+
+class AttnBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+
+        self.norm = Normalize(in_channels)
+        self.q = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.k = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.v = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.proj_out = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=1,
+                                        stride=1,
+                                        padding=0)
+
+    def forward(self, x):
+        h_ = x
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+
+        # compute attention
+        b, c, h, w = q.shape
+        q = q.reshape(b, c, h*w)
+        q = q.permute(0, 2, 1)   # b,hw,c
+        k = k.reshape(b, c, h*w)  # b,c,hw
+        w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+        w_ = w_ * (int(c)**(-0.5))
+        w_ = torch.nn.functional.softmax(w_, dim=2)
+
+        # attend to values
+        v = v.reshape(b, c, h*w)
+        w_ = w_.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
+        # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+        h_ = torch.bmm(v, w_)
+        h_ = h_.reshape(b, c, h, w)
+
+        h_ = self.proj_out(h_)
+
+        return x+h_
+
+
+class Model(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.config.split_shortcut = False
+        self.a_list = None
+        self.b_list = None
+        self.time = 0
+        self.timesteps = 0
+        ch, out_ch, ch_mult = config.model.ch, config.model.out_ch, tuple(config.model.ch_mult)
+        num_res_blocks = config.model.num_res_blocks
+        attn_resolutions = config.model.attn_resolutions
+        dropout = config.model.dropout
+        in_channels = config.model.in_channels
+        resolution = config.data.image_size
+        resamp_with_conv = config.model.resamp_with_conv
+        num_timesteps = config.diffusion.num_diffusion_timesteps
+        
+        if config.model.type == 'bayesian':
+            self.logvar = nn.Parameter(torch.zeros(num_timesteps))
+        
+        self.ch = ch
+        self.temb_ch = self.ch*4
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+
+        # timestep embedding
+        self.temb = nn.Module()
+        self.temb.dense = nn.ModuleList([
+            torch.nn.Linear(self.ch,
+                            self.temb_ch),
+            torch.nn.Linear(self.temb_ch,
+                            self.temb_ch),
+        ])
+
+        # downsampling
+        self.conv_in = torch.nn.Conv2d(in_channels,
+                                       self.ch,
+                                       kernel_size=3,
+                                       stride=1,
+                                       padding=1)
+
+        curr_res = resolution
+        in_ch_mult = (1,)+ch_mult
+        self.down = nn.ModuleList()
+        block_in = None
+        for i_level in range(self.num_resolutions):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_in = ch*in_ch_mult[i_level]
+            block_out = ch*ch_mult[i_level]
+            for i_block in range(self.num_res_blocks):
+                block.append(ResnetBlock(in_channels=block_in,
+                                         out_channels=block_out,
+                                         temb_channels=self.temb_ch,
+                                         dropout=dropout))
+                block_in = block_out
+                if curr_res in attn_resolutions:
+                    attn.append(AttnBlock(block_in))
+            down = nn.Module()
+            down.block = block
+            down.attn = attn
+            if i_level != self.num_resolutions-1:
+                down.downsample = Downsample(block_in, resamp_with_conv)
+                curr_res = curr_res // 2
+            self.down.append(down)
+
+        # middle
+        self.mid = nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in,
+                                       out_channels=block_in,
+                                       temb_channels=self.temb_ch,
+                                       dropout=dropout)
+        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in,
+                                       out_channels=block_in,
+                                       temb_channels=self.temb_ch,
+                                       dropout=dropout)
+
+        # upsampling
+        self.up = nn.ModuleList()
+        for i_level in reversed(range(self.num_resolutions)):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_out = ch*ch_mult[i_level]
+            skip_in = ch*ch_mult[i_level]
+            for i_block in range(self.num_res_blocks+1):
+                if i_block == self.num_res_blocks:
+                    skip_in = ch*in_ch_mult[i_level]
+                block.append(ResnetBlock(in_channels=block_in+skip_in,
+                                         out_channels=block_out,
+                                         temb_channels=self.temb_ch,
+                                         dropout=dropout))
+                block_in = block_out
+                if curr_res in attn_resolutions:
+                    attn.append(AttnBlock(block_in))
+            up = nn.Module()
+            up.block = block
+            up.attn = attn
+            if i_level != 0:
+                up.upsample = Upsample(block_in, resamp_with_conv)
+                curr_res = curr_res * 2
+            self.up.insert(0, up)  # prepend to get consistent order
+
+        # end
+        self.norm_out = Normalize(block_in)
+        self.conv_out = torch.nn.Conv2d(block_in,
+                                        out_ch,
+                                        kernel_size=3,
+                                        stride=1,
+                                        padding=1)
+
+    def set_cache_para(self, branch):
+        #cache para
+        self.branch = branch
+        self.select_layer, self.select_block = branch//3, branch%3
+        if self.select_block == 2:
+            skip_layer = self.select_layer + 1
+            skip_block = 0
+            self.up_select_block = 2
+            self.up_select_layer = self.select_layer + 1
+        else:
+            skip_layer = self.select_layer
+            skip_block = self.select_block + 1
+            self.up_select_block = 1 - self.select_block
+            self.up_select_layer = self.select_layer
+        self.down[skip_layer].block[skip_block].skip_start = True
+        self.up[self.up_select_layer].block[self.up_select_block].skip_end = True
+
+    def set_random_cache_para(self):
+        """
+        从15个缓存位置中随机选择一个
+        """
+        cache_positions = [
+            # 级别3
+            (3, 0, 3, 0, 3, 1, "up3.block0"),  # 缓存: up3.block0, 截断: down3.block0, 重启: up3.block1
+            (3, 1, 3, 1, 3, 2, "up3.block1"),  # 缓存: up3.block1, 截断: down3.block1, 重启: up3.block2
+            (3, 2, 3, 2, 3, 3, "up3.block2"),  # 缓存: up3.block2, 截断: down3.block2, 重启: up3.upsample
+            (3, -1, 3, 2, 2, 0, "up3.upsample"),  # 缓存: up3.upsample, 截断: down3.block2, 重启: up2.block0
+
+            # 级别2
+            (2, 0, 2, 0, 2, 1, "up2.block0"),  # 缓存: up2.block0, 截断: down2.block0, 重启: up2.block1
+            (2, 1, 2, 1, 2, 2, "up2.block1"),  # 缓存: up2.block1, 截断: down2.block1, 重启: up2.block2
+            (2, 2, 2, 2, 2, 3, "up2.block2"),  # 缓存: up2.block2, 截断: down2.block2, 重启: up2.upsample
+            (2, -1, 2, 1, 1, 0, "up2.upsample"),  # 缓存: up2.upsample, 截断: down2.block1, 重启: up1.block0
+
+            # 级别1
+            (1, 0, 1, 0, 1, 1, "up1.block0"),  # 缓存: up1.block0, 截断: down1.block0, 重启: up1.block1
+            (1, 1, 1, 1, 1, 2, "up1.block1"),  # 缓存: up1.block1, 截断: down1.block1, 重启: up1.block2
+            (1, 2, 1, 2, 1, 3, "up1.block2"),  # 缓存: up1.block2, 截断: down1.block2, 重启: up1.upsample
+            (1, -1, 1, 1, 0, 0, "up1.upsample"),  # 缓存: up1.upsample, 截断: down1.block1, 重启: up0.block0
+
+            # 级别0
+            (0, 0, 0, 0, 0, 1, "up0.block0"),  # 缓存: up0.block0, 截断: down0.block0, 重启: up0.block1
+            (0, 1, 0, 1, 0, 2, "up0.block1"),  # 缓存: up0.block1, 截断: down0.block1, 重启: up0.block2
+            (0, 2, 0, 2, -1, -1, "up0.block2"),  # 缓存: up0.block2, 截断: down0.block2, 重启: 无(直接输出)
+        ]
+        """
+        从通道数为256的缓存位置中随机选择一个
+        """
+        # 定义通道数为256的缓存位置 (缓存层, 缓存块, 下采样截断层, 下采样截断块, 上采样重启层, 上采样重启块, 描述)
+        cache_positions_256 = [
+            # up2级别 - 通道数256
+            (2, 2, 1, 2, 1, 0, "up2.block2"),  # 缓存: up2.block2, 截断: down1.downsample, 重启: up1.block0
+            (2, -1, 1, 1, 1, 0, "up2.upsample"),  # 缓存: up2.upsample, 截断: down1.block1, 重启: up1.block0
+
+            # up1级别 - 通道数256
+            (1, 0, 1, 1, 1, 1, "up1.block0"),  # 缓存: up1.block0, 截断: down1.block1, 重启: up1.block1
+            (1, 1, 1, 0, 1, 2, "up1.block1"),  # 缓存: up1.block1, 截断: down1.block0, 重启: up1.block2
+        ]
+
+        # 随机选择一个位置
+        import random
+        selected_idx = random.randint(0, len(cache_positions_256) - 1)
+
+        cache_layer, cache_block, down_layer, down_block, restart_layer, restart_block, description = \
+        cache_positions_256[selected_idx]
+
+        # 设置缓存参数
+        self.branch = selected_idx
+        self.select_layer, self.select_block = down_layer, down_block
+        self.up_select_layer, self.up_select_block = restart_layer, restart_block
+        self.current_cache_description = description  # 保存描述信息
+        # 清除之前的标记
+        self._clear_skip_marks()
+
+        # 设置新的标记
+        self.down[down_layer].block[down_block].skip_start = True
+        self.up[restart_layer].block[restart_block].skip_end = True
+        print(f"时间步缓存位置更新: {description} (branch={selected_idx})")
+
+    def _clear_skip_marks(self):
+        """清除之前设置的skip标记"""
+        for i_level in range(self.num_resolutions):
+            for i_block in range(self.num_res_blocks):
+                if hasattr(self.down[i_level].block[i_block], 'skip_start'):
+                    self.down[i_level].block[i_block].skip_start = False
+
+        for i_level in reversed(range(self.num_resolutions)):
+            for i_block in range(self.num_res_blocks + 1):
+                if hasattr(self.up[i_level].block[i_block], 'skip_end'):
+                    self.up[i_level].block[i_block].skip_end = False
+
+    def forward(self, x, t, context, **kwargs): #, prv_f=None, branch=None
+        prv_f = kwargs['prv_f']
+        branch = kwargs['branch']
+        assert x.shape[2] == x.shape[3] == self.resolution
+
+        # timestep embedding
+        temb = get_timestep_embedding(t, self.ch)
+        temb = self.temb.dense[0](temb)
+        temb = nonlinearity(temb)
+        temb = self.temb.dense[1](temb)
+
+        # 这里的if分支是运用缓存的路径
+        if prv_f is not None:
+            features = None
+            #print("in quick path")
+            hs = [self.conv_in(x)]
+            for i_level in range(self.num_resolutions): 
+                for i_block in range(self.num_res_blocks):
+                    h = self.down[i_level].block[i_block](hs[-1], temb)
+                    if len(self.down[i_level].attn) > 0:
+                        h = self.down[i_level].attn[i_block](h)
+                    hs.append(h)  
+                    if i_level == self.select_layer and i_block == self.select_block:
+                        break
+
+                if i_level == self.select_layer and i_block == self.select_block:
+                    break
+                if i_level != self.num_resolutions-1:
+                    hs.append(self.down[i_level].downsample(hs[-1]))
+                if i_level == self.select_layer:
+                    break
+            h = prv_f
+
+            for i_level in reversed(range(self.num_resolutions)):
+                if i_level > self.up_select_layer:
+                    continue
+
+                for i_block in range(self.num_res_blocks+1):
+                    if i_level == self.up_select_layer and i_block < self.up_select_block:
+                        continue
+                    if kwargs['prv_f'] is not None:
+                        kwargs['prv_f'] = None
+                        if self.a_list is not None:
+                            # 这里！应用Cache修正
+                            a = self.a_list[self.time].contiguous().view(1, self.a_list[self.time].size(0), 1, 1)
+                            b = self.b_list[self.time].contiguous().view(1, self.b_list[self.time].size(0), 1, 1)
+                            h = a * h + b
+
+                    if i_level < 4 and self.config.split_shortcut:
+                        split_ = h.size(1)
+                    else:
+                        split_ = 0
+                    hs_last = hs.pop()
+
+                    if self.config.split_shortcut:
+                        h = self.up[i_level].block[i_block](
+                            torch.cat([h, hs_last], dim=1), temb, split=split_)
+                    else:
+                        h = self.up[i_level].block[i_block](
+                            torch.cat([h, hs_last], dim=1), temb)
+                    if len(self.up[i_level].attn) > 0:
+                        h = self.up[i_level].attn[i_block](h)
+                
+                if i_level != 0:
+                    h = self.up[i_level].upsample(h)
+        else: # downsampling
+            hs = [self.conv_in(x)]
+            for i_level in range(self.num_resolutions):
+                for i_block in range(self.num_res_blocks):
+                    h = self.down[i_level].block[i_block](hs[-1], temb)
+                    if len(self.down[i_level].attn) > 0:
+                        h = self.down[i_level].attn[i_block](h)
+                    hs.append(h)
+                   
+                if i_level != self.num_resolutions-1:
+                    hs.append(self.down[i_level].downsample(hs[-1]))
+              
+
+            # middle
+            h = hs[-1]
+            h = self.mid.block_1(h, temb)
+            h = self.mid.attn_1(h)
+            h = self.mid.block_2(h, temb)
+
+            features = []
+            # upsampling
+            for i_level in reversed(range(self.num_resolutions)):
+                for i_block in range(self.num_res_blocks+1):
+                    # if i_level < 4 and self.config.split_shortcut:
+                    if self.config.split_shortcut:
+                        split_ = h.size(1)
+                    else:
+                        split_ = 0
+                    hs_last = hs.pop()
+
+                    if i_level == self.up_select_layer and i_block == self.up_select_block: 
+                        features.append(h.detach()) 
+                    if self.config.split_shortcut:
+                        h = self.up[i_level].block[i_block](
+                            torch.cat([h, hs_last], dim=1), temb, split=split_)
+                    else:
+                        h = self.up[i_level].block[i_block](
+                            torch.cat([h, hs_last], dim=1), temb)
+                    if len(self.up[i_level].attn) > 0:
+                        h = self.up[i_level].attn[i_block](h)
+                    #features.append(h.detach())
+                    
+                if i_level != 0:
+                    h = self.up[i_level].upsample(h)
+            
+        self.time = self.time + 1
+        if self.time == self.timesteps:
+            self.time = 0
+        # end
+        h = self.norm_out(h)
+        h = nonlinearity(h)
+        h = self.conv_out(h)
+        return h, features
