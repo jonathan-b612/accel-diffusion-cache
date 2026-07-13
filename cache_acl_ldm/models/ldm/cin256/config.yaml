@@ -1,0 +1,116 @@
+model:
+  base_learning_rate: 1.0e-06
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: image
+    cond_stage_key: class_label
+    image_size: 32
+    channels: 4
+    cond_stage_trainable: true
+    conditioning_key: crossattn
+    monitor: val/loss_simple_ema
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32
+        in_channels: 4
+        out_channels: 4
+        model_channels: 256
+        attention_resolutions:
+        - 4
+        - 2
+        - 1
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 4
+        num_head_channels: 32
+        use_spatial_transformer: true
+        transformer_depth: 1
+        context_dim: 512
+    first_stage_config:
+      target: ldm.models.autoencoder.VQModelInterface
+      params:
+        embed_dim: 4
+        n_embed: 16384
+        ddconfig:
+          double_z: false
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions:
+          - 32
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.ClassEmbedder
+      params:
+        embed_dim: 512
+        key: class_label
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 64
+    num_workers: 12
+    wrap: false
+    train:
+      target: ldm.data.imagenet.ImageNetTrain
+      params:
+        config:
+          size: 256
+    validation:
+      target: ldm.data.imagenet.ImageNetValidation
+      params:
+        config:
+          size: 256
+
+dataset_generate:
+  data_num: 500  # 生成500个数据样本
+  image_num: 5000  # 每个样本生成5000张图像
+  dataset_path: "dataset/imagenet-dataset"  # 数据集保存路径
+  metric: "fid"  # 评估指标
+
+  # 缓存调度配置（优先使用）
+  cache_schedule:
+    type: "multinomial+hierarchical"  # 或 "multinomial"
+#    type: "multinomial"  # 或 "multinomial"
+    multinomial:
+      prob_vector: [0.15, 0.15, 0.35, 0.35]  # 4个缓存位置的概率分布 ； 特别地，对于LDM，使用浅层缓存的概率更高
+      ms_length: 60 # dpm
+
+    hierarchical:
+      alpha: 0.4  # 狄利克雷分布参数
+
+  # 旧的缓存策略（向后兼容）
+  cache_strategy:
+    mode: "random"  # fixed_cycle, multinomial, random
+
+    # 当mode为fixed_cycle时的配置
+    fixed_positions: [1, 2, 3, 4]  # 循环的位置
+
+    # 当mode为multinomial时的配置
+    prob_vector: [0.25, 0.25, 0.25, 0.25]
+
+optim:
+    weight_decay: 0.000
+    optimizer: "Adam"
+    lr: 0.00001
+    beta1: 0.9
+    amsgrad: false
+    eps: 0.00000001
+    grad_clip: 1.0
